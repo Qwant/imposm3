@@ -1,0 +1,128 @@
+name: Test and Publish release
+
+on:
+  push:
+  pull_request:
+
+env:
+  GEOS_VERSION: '3.7.3'
+  LEVELDB_VERSION: '1.22'
+
+  # NOTE increase DEPS_REVISION everytime one of the compiled deps changes!
+  DEPS_REVISION: '3'
+
+  # PKG_DIR is where we assemble the final package for releases
+  PKG_DIR: /tmp/imposm_packaging
+
+  PGUSER: postgres
+  PGHOST: localhost
+
+jobs:
+  build:
+    runs-on: ubuntu-18.04
+
+    services:
+      postgres:
+        image: postgis/postgis:9.5-2.5
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Init env
+        run: |
+          # PREFIX is where we install our compiled deps
+          PREFIX="${HOME}/local-${DEPS_REVISION}"
+          echo "PREFIX=$PREFIX" >> $GITHUB_ENV
+
+          # tell Go to find our compiled deps
+          echo "CGO_CFLAGS=-I${PREFIX}/include" >> $GITHUB_ENV
+          echo "CGO_LDFLAGS=-L${PREFIX}/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=${PREFIX}/lib" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - uses: actions/setup-go@v2
+        with:
+          go-version: '1.15'
+
+      - name: Install system dependencies
+        run: sudo apt-get -y --no-install-suggests --no-install-recommends install osmosis chrpath
+
+      - name: Init Postgres
+        run: |
+          psql -c "create extension if not exists postgis"
+          psql -c "create extension if not exists hstore"
+
+      - name: Before install
+        run: |
+          mkdir -p ${HOME}/build
+
+          # Build Geos
+          if [[ ! -e ${PREFIX}/lib/libgeos_c.so ]]; then
+            curl -fsSL http://download.osgeo.org/geos/geos-${GEOS_VERSION}.tar.bz2 | \
+              tar -jxf - -C ${HOME}/build
+            cd ${HOME}/build/geos-${GEOS_VERSION}
+            ./configure --prefix=$PREFIX
+            make -j2
+            make install
+          fi
+
+          # Build LevelDB
+          if [[ ! -e ${PREFIX}/lib/libleveldb.so ]]; then
+            mkdir -p ${HOME}/build/leveldb
+            curl -fsSL https://github.com/google/leveldb/archive/${LEVELDB_VERSION}.tar.gz | \
+              tar -zxf - --strip-components 1 -C ${HOME}/build/leveldb
+            mkdir -p ${HOME}/build/leveldb/build
+            cd ${HOME}/build/leveldb/build
+            cmake .. -DBUILD_SHARED_LIBS=1 -DCMAKE_BUILD_TYPE=Release && make -j 2
+            mkdir -p ${PREFIX}/{lib,include}
+            cp -R ${HOME}/build/leveldb/build/liblevel* ${PREFIX}/lib/
+            cp -R ${HOME}/build/leveldb/include/leveldb ${PREFIX}/include/
+          fi
+
+      - name: Build
+        run: LEVELDB_POST_121=1 make
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p ${PKG_DIR}/lib
+
+          # copy files
+          cp imposm ${PKG_DIR}
+          ln -s imposm ${PKG_DIR}/imposm3
+          cp README.md ${PKG_DIR}
+          cp example-mapping.json ${PKG_DIR}/mapping.json
+
+          # copy/link libs
+          cd ${PREFIX}/lib
+          cp libgeos_c.so ${PKG_DIR}/lib
+          ln -s libgeos_c.so ${PKG_DIR}/lib/libgeos_c.so.1
+          cp libgeos.so ${PKG_DIR}/lib
+          ln -s libgeos.so ${PKG_DIR}/lib/libgeos-${GEOS_VERSION}.so
+          cp -R libleveldb.so* ${PKG_DIR}/lib
+
+          # update RPATH of libgeos_c.so so that is points to our libgeos.so
+          chrpath ${PKG_DIR}/lib/libgeos_c.so -r '${ORIGIN}'
+
+          # create tar.gz
+          BUILD_VERSION=`${PKG_DIR}/imposm version`-linux-x86-64
+          mv ${PKG_DIR} /tmp/imposm-${BUILD_VERSION}
+          cd /tmp && tar zcvf imposm-${BUILD_VERSION}.tar.gz imposm-${BUILD_VERSION}
+
+          echo "BUILD_VERSION=${BUILD_VERSION}" >> $GITHUB_ENV
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: '/tmp/imposm-*.tar.gz'
+
